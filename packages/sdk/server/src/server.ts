@@ -5,7 +5,7 @@
  * @module @deepseek-ai/dsh-sdk-jsonrpc-server/server
  */
 
-import type { Context } from '@deepseek-ai/cordis'
+import type { Message } from '@deepseek-ai/cordis'
 import { resolve } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
@@ -75,6 +75,78 @@ function successStatus(reason: string, options: HarnessSdkJsonRpcServerOptions):
   return reason === 'max-tokens' && options.maxTokensAsSuccess === true ? 'ok' : 'error'
 }
 
+const NO_ADAPTER_TAIL_LIMIT = 20
+const NO_ADAPTER_LINE_LIMIT = 300
+const NO_ADAPTER_MESSAGE_LIMIT = 4000
+const NO_ADAPTER_WARN_RING: Message[] = []
+
+function registerNoAdapterTailExporter(ctx: Context): void {
+  try {
+    const exporter: Exporter = {
+      levels: { default: 2 },
+      export: (message: Message) => {
+        NO_ADAPTER_WARN_RING.push(message)
+        if (NO_ADAPTER_WARN_RING.length > NO_ADAPTER_TAIL_LIMIT) {
+          NO_ADAPTER_WARN_RING.splice(0, NO_ADAPTER_WARN_RING.length - NO_ADAPTER_TAIL_LIMIT)
+        }
+      },
+    }
+    ctx.logger?.exporter?.(exporter)
+  } catch {}
+}
+
+function noAdapterArgText(arg: unknown): string {
+  if (typeof arg === 'string') return arg
+  if (arg instanceof Error) return arg.message
+  try {
+    return JSON.stringify(arg)
+  } catch {
+    return String(arg)
+  }
+}
+
+function noAdapterLine(message: Message): string {
+  const args = Array.isArray(message?.args) ? message.args : []
+  const text = args.map(noAdapterArgText).join(' ').replace(/\s+/g, ' ').trim()
+  const line = `[${message?.type}] ${message?.name ?? 'dsh'}: ${text}`
+  return line.length > NO_ADAPTER_LINE_LIMIT ? `${line.slice(0, NO_ADAPTER_LINE_LIMIT)}...` : line
+}
+
+function noAdapterTail(ctx: Context): string {
+  let entries: Message[] = []
+  try {
+    if (Array.isArray(ctx.logger?.buffer)) entries = entries.concat(ctx.logger.buffer)
+  } catch {}
+  entries = entries.concat(NO_ADAPTER_WARN_RING)
+  const deduped = new Map<number | string, Message>()
+  for (const message of entries) {
+    if (message?.type !== 'error' && message?.type !== 'warn') continue
+    const key = message.sn ?? `${message.ts}:${message.name}:${message.type}`
+    if (!deduped.has(key)) deduped.set(key, message)
+  }
+  const tail = [...deduped.values()]
+  tail.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0) || (a.sn ?? 0) - (b.sn ?? 0))
+  const kept = tail.slice(-NO_ADAPTER_TAIL_LIMIT).map(noAdapterLine)
+  while (kept.length > 0 && `dsh log tail:\n${kept.join('\n')}`.length > NO_ADAPTER_MESSAGE_LIMIT) kept.shift()
+  return kept.length === 0 ? 'dsh log tail: (empty)' : `dsh log tail:\n${kept.join('\n')}`
+}
+
+function noAdapterMessage(ctx: Context, provider: string): string {
+  const first = `no adapter registered for provider "${provider}"`
+  let registered = 'registered routes: (none)'
+  try {
+    const routes = ctx.get('llm')?.listProviders?.()
+      .map((entry: { id?: string }) => entry?.id)
+      .filter((id: unknown): id is string => typeof id === 'string')
+    if (routes?.length > 0) registered = `registered routes: ${routes.join(', ')}`
+  } catch {}
+  try {
+    return `${first}\n${registered}\n${noAdapterTail(ctx)}`
+  } catch {
+    return first
+  }
+}
+
 /**
  * SDK server over one booted harness context and transport peer. Construction
  * subscribes to session, agent, and subagent lifecycle events until shutdown;
@@ -100,6 +172,7 @@ export class HarnessSdkJsonRpcServer {
     private readonly options: HarnessSdkJsonRpcServerOptions = {},
   ) {
     const serverOptions = this.options
+    registerNoAdapterTailExporter(ctx)
     this.disposers.push(ctx.on('session/event', (session, event) => {
       const record = this.sessions.get(session.id)
       if (event.type === 'turn/end' && record?.handle.agent.session === session
@@ -168,7 +241,7 @@ export class HarnessSdkJsonRpcServer {
       ? undefined
       : ReasoningEffortId(params.reasoningEffort)
     if (!this.hasAdapterFor(provider)) {
-      if (provider !== 'deepseek-official') throw new Error(`no adapter registered for provider "${provider}"`)
+      if (provider !== 'deepseek-official') throw new Error(noAdapterMessage(this.ctx, provider))
       this.llmFiber = await this.ctx.plugin(LlmDeepSeek)
     }
     // Adapter presence was read from this service above; a successful fallback mount also requires it.
